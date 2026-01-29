@@ -4,7 +4,10 @@ from typing import Any, Callable, Generator, cast, get_args
 import mlx.core as mx
 from mlx_lm.generate import stream_generate
 from mlx_lm.models.cache import trim_prompt_cache
-from mlx_lm.sample_utils import make_sampler
+from mlx_lm.sample_utils import (
+    make_logits_processors,  # pyright: ignore[reportUnknownVariableType]
+    make_sampler,
+)
 from mlx_lm.tokenizer_utils import TokenizerWrapper
 
 from exo.shared.types.api import (
@@ -198,10 +201,35 @@ def mlx_generate(
         eos_ids = eos_ids_from_tokenizer(tokenizer)
         logits_processors = [ban_token_ids(eos_ids)]
 
-    sampler = make_sampler(
-        temp=task.temperature if task.temperature is not None else 0.7,
-        top_p=task.top_p if task.top_p is not None else 1.0,
-    )
+    # MiniMax M2 models require specific sampling settings per official docs:
+    # https://github.com/MiniMax-AI/MiniMax-M2.1
+    # - Higher temperature (1.0) for proper reasoning
+    # - Light repetition penalty with larger context to prevent conceptual loops
+    is_minimax = task.model and "minimax" in task.model.lower()
+    if is_minimax:
+        logits_processors.extend(
+            cast(
+                list[Callable[[mx.array, mx.array], mx.array]],
+                make_logits_processors(
+                    repetition_penalty=1.05,
+                    repetition_context_size=256,
+                ),
+            )
+        )
+
+    # Use MiniMax-specific sampling parameters if no user override provided
+    if is_minimax:
+        sampler = make_sampler(
+            temp=task.temperature if task.temperature is not None else 1.0,
+            top_p=task.top_p if task.top_p is not None else 0.95,
+            top_k=40,
+            min_p=0.05,
+        )
+    else:
+        sampler = make_sampler(
+            temp=task.temperature if task.temperature is not None else 0.7,
+            top_p=task.top_p if task.top_p is not None else 1.0,
+        )
 
     # Prefill cache with all tokens except the last one
     prefill_tps = prefill(model, tokenizer, sampler, prompt_tokens[:-1], caches)
