@@ -175,11 +175,14 @@ def mlx_generate(
     # Currently we support chat-completion tasks only.
     logger.debug(f"task_params: {task}")
 
+    is_minimax = bool(task.model and "minimax" in task.model.lower())
+
     if task.seed is not None:
         mx.random.seed(task.seed)
 
     # Do not use the prefix cache if we are trying to do benchmarks.
-    if is_bench:
+    # Disable prefix cache for MiniMax models to rule out cache-related repetition loops.
+    if is_bench or is_minimax:
         kv_prefix_cache = None
 
     # Use prefix cache if available, otherwise create fresh cache
@@ -205,7 +208,6 @@ def mlx_generate(
     # https://github.com/MiniMax-AI/MiniMax-M2.1
     # - Higher temperature (1.0) for proper reasoning
     # - Light repetition penalty with larger context to prevent conceptual loops
-    is_minimax = task.model and "minimax" in task.model.lower()
     if is_minimax:
         logits_processors.extend(
             cast(
