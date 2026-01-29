@@ -5,7 +5,6 @@ import mlx.core as mx
 from mlx_lm.generate import stream_generate
 from mlx_lm.models.cache import trim_prompt_cache
 from mlx_lm.sample_utils import (
-    make_logits_processors,  # pyright: ignore[reportUnknownVariableType]
     make_sampler,
 )
 from mlx_lm.tokenizer_utils import TokenizerWrapper
@@ -143,6 +142,45 @@ def warmup_inference(
     return tokens_generated
 
 
+def make_ngram_blocker(ngram_size: int = 10) -> Callable[[mx.array, mx.array], mx.array]:
+    """Block tokens that would create a repeated n-gram sequence.
+
+    Tracks generated token history and suppresses any token that would complete
+    an n-gram already seen. This directly prevents repetition loops.
+    """
+    generated_tokens: list[int] = []
+
+    def proc(_history: mx.array, logits: mx.array) -> mx.array:
+        if len(generated_tokens) < ngram_size:
+            # Record token from history (last token is the most recent)
+            if len(_history) > 0:
+                generated_tokens.append(int(_history[-1].item()))
+            return logits
+
+        # Record the latest generated token
+        if len(_history) > 0:
+            generated_tokens.append(int(_history[-1].item()))
+
+        # Build the current (n-1)-gram suffix we'd be extending
+        context = tuple(generated_tokens[-(ngram_size - 1):])
+
+        # Scan history for all prior occurrences of this context
+        blocked_token_ids: set[int] = set()
+        for i in range(len(generated_tokens) - ngram_size):
+            window = tuple(generated_tokens[i:i + ngram_size - 1])
+            if window == context:
+                # The token that followed this context before — block it
+                blocked_token_ids.add(generated_tokens[i + ngram_size - 1])
+
+        if blocked_token_ids:
+            for tid in blocked_token_ids:
+                logits[..., tid] = -1e9
+
+        return logits
+
+    return proc
+
+
 def ban_token_ids(token_ids: list[int]) -> Callable[[mx.array, mx.array], mx.array]:
     token_ids = [int(t) for t in token_ids]
 
@@ -181,8 +219,7 @@ def mlx_generate(
         mx.random.seed(task.seed)
 
     # Do not use the prefix cache if we are trying to do benchmarks.
-    # Disable prefix cache for MiniMax models to rule out cache-related repetition loops.
-    if is_bench or is_minimax:
+    if is_bench:
         kv_prefix_cache = None
 
     # Use prefix cache if available, otherwise create fresh cache
@@ -204,20 +241,10 @@ def mlx_generate(
         eos_ids = eos_ids_from_tokenizer(tokenizer)
         logits_processors = [ban_token_ids(eos_ids)]
 
-    # MiniMax M2 models require specific sampling settings per official docs:
-    # https://github.com/MiniMax-AI/MiniMax-M2.1
-    # - Higher temperature (1.0) for proper reasoning
-    # - Light repetition penalty with larger context to prevent conceptual loops
+    # MiniMax M2 models are prone to severe repetition loops.
+    # Use n-gram blocking to prevent any repeated 10-token sequence.
     if is_minimax:
-        logits_processors.extend(
-            cast(
-                list[Callable[[mx.array, mx.array], mx.array]],
-                make_logits_processors(
-                    repetition_penalty=1.05,
-                    repetition_context_size=256,
-                ),
-            )
-        )
+        logits_processors.append(make_ngram_blocker(ngram_size=10))
 
     # Use MiniMax-specific sampling parameters if no user override provided
     if is_minimax:
