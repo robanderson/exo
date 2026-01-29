@@ -145,34 +145,32 @@ def warmup_inference(
 def make_ngram_blocker(ngram_size: int = 10) -> Callable[[mx.array, mx.array], mx.array]:
     """Block tokens that would create a repeated n-gram sequence.
 
-    Tracks generated token history and suppresses any token that would complete
-    an n-gram already seen. This directly prevents repetition loops.
+    mlx-lm's generate_step passes the full accumulated token history as the
+    first arg to logits processors. We use that directly to find any (n-1)-gram
+    suffix match and block the token that followed it previously.
     """
-    generated_tokens: list[int] = []
 
-    def proc(_history: mx.array, logits: mx.array) -> mx.array:
-        if len(generated_tokens) < ngram_size:
-            # Record token from history (last token is the most recent)
-            if len(_history) > 0:
-                generated_tokens.append(int(_history[-1].item()))
+    def proc(token_history: mx.array, logits: mx.array) -> mx.array:
+        history_len = token_history.shape[0]
+        if history_len < ngram_size:
             return logits
 
-        # Record the latest generated token
-        if len(_history) > 0:
-            generated_tokens.append(int(_history[-1].item()))
+        # Convert to Python list once for fast slicing
+        tokens = token_history.tolist()
 
-        # Build the current (n-1)-gram suffix we'd be extending
-        context = tuple(generated_tokens[-(ngram_size - 1):])
+        # The last (n-1) tokens form the context we're about to extend
+        context = tokens[-(ngram_size - 1):]
 
-        # Scan history for all prior occurrences of this context
+        # Scan all earlier positions for this same (n-1)-gram context
         blocked_token_ids: set[int] = set()
-        for i in range(len(generated_tokens) - ngram_size):
-            window = tuple(generated_tokens[i:i + ngram_size - 1])
-            if window == context:
-                # The token that followed this context before — block it
-                blocked_token_ids.add(generated_tokens[i + ngram_size - 1])
+        scan_end = history_len - ngram_size + 1
+        for i in range(scan_end):
+            if tokens[i:i + ngram_size - 1] == context:
+                # Block the token that followed this context before
+                blocked_token_ids.add(tokens[i + ngram_size - 1])
 
         if blocked_token_ids:
+            logger.debug(f"ngram_blocker: blocking {len(blocked_token_ids)} tokens at position {history_len}")
             for tid in blocked_token_ids:
                 logits[..., tid] = -1e9
 
@@ -206,6 +204,9 @@ def mlx_generate(
     prompt: str,
     kv_prefix_cache: KVPrefixCache | None = None,
 ) -> Generator[GenerationResponse]:
+    # Watermark: confirm correct code version is running
+    logger.info("[generate v3] ngram_blocker active for minimax models")
+
     # Ensure that generation stats only contains peak memory for this generation
     mx.reset_peak_memory()
     is_bench: bool = isinstance(task, BenchChatCompletionTaskParams)
