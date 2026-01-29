@@ -269,6 +269,15 @@ def mlx_generate(
 
     max_tokens = task.max_tokens or MAX_TOKENS
     generated_text_parts: list[str] = []
+
+    # Emit version watermark as first token so we can confirm code version in output
+    yield GenerationResponse(
+        text="[exo-gen-v3] ",
+        token=0,
+        finish_reason=None,
+        stats=None,
+    )
+
     generation_start_time = time.perf_counter()
     for out in stream_generate(
         model=model,
